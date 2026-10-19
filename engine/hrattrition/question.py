@@ -38,12 +38,12 @@ class QuestionSpec:
 
     def answerable_question(self) -> str:
         if self.analysis_mode == "predictive":
-            return (f"기준일 {self.as_of} 이후 {self.horizon_days}일 이내 {self.target} 확률을 {self.population_text()}에 대해 예측한다"
-                    f"(제공된 라벨로 학습한 모델. 라벨 정의가 이 질문과 같은지 확인 필요, 무작위 교차검증이라 시간 분리 검증은 아님).")
+            return (f"기준일 {self.as_of} 이후 {self.horizon_days}일 이내 {self.target} 위험 순위를 {self.population_text()}에 대해 예측한다"
+                    f"(과거 데이터로 학습·시간 분리 평가한 고정 모델. 현재 직원의 결과 라벨은 학습에 사용하지 않음).")
         if self.analysis_mode == "change":
             return f"두 기준일 사이 {self.population_text()}의 퇴사 관련 신호 변화를 비교한다."
         return (f"기준일 {self.as_of or '(파일 기준)'} 현재 {self.population_text()}의 퇴사 관련 신호를 진단한다. "
-                f"실제 퇴사 라벨이 없어 '{self.horizon_days}일 이내 {self.target}' 여부는 예측하지 않는다.")
+                f"검증된 예측 모델을 적용하지 않아 '{self.horizon_days}일 이내 {self.target}' 여부는 예측하지 않는다.")
 
     def sentence(self) -> str:
         return self.answerable_question()
@@ -66,7 +66,9 @@ class QuestionSpec:
         q = cls(**base)
         if target:
             q.target = target
-        if horizon_days:
+        if horizon_days is not None:
+            if int(horizon_days) <= 0:
+                raise ValueError("예측 기간은 양의 정수여야 합니다.")
             q.horizon_days = int(horizon_days)
         if population:
             q.population = population

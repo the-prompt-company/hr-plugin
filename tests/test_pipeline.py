@@ -130,7 +130,8 @@ def test_roster_single_sheet_mode(tmp_path: Path):
 def test_labels_from_sheet_and_csv(tmp_path: Path):
     roster = pd.DataFrame({"사번": [f"E{i}" for i in range(30)], "입사일": ["2020-01-01"] * 30, "퇴사여부": ["예"] * 12 + ["아니오"] * 18})
     ds = load_roster_frame(roster, "mem")
-    assert load_labels(ds).sum() == 12
+    with pytest.raises(ValueError, match="left"):
+        load_labels(ds)
     p = tmp_path / "labels.csv"
     p.write_text("employee_id,left\nE0,maybe\n", encoding="utf-8")
     with pytest.raises(ValueError):
@@ -148,7 +149,7 @@ def test_result_workbook_roundtrip_and_dashboard(workbook, tmp_path: Path):
     from hrattrition.report import read_result_extras
     extras = read_result_extras(xlsx)
     html = build_dashboard(f2, s2, meta["metrics"], meta["manifest"], ov, tmp_path / "d.html", meta["unavailable"], extras).read_text(encoding="utf-8")
-    assert "신호 보드" in html and "히트맵" in html and "워치리스트" in html and "__DATA__" not in html and "__EXTRAS__" not in html
+    assert "조직별 HR 지표 히트맵" in html and "직원 목록" in html and "유지 우선순위" in html and "__DATA__" not in html and "__EXTRAS__" not in html
     assert "cdnjs" not in html and "<script src=" not in html   # 외부 리소스 없음(오프라인에서도 열림)
     json.loads(html[html.index("const DATA=") + 11: html.index(", DOCS=")])
     # 공유용: 이름·사번이 파일에서 제거되고 가명으로 바뀐다
@@ -319,22 +320,16 @@ def test_version_single_source():
     assert "dynamic" in (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
 
-def test_fixture_with_leavers_runs_predictive_mode(tmp_path: Path):
-    """퇴사자 포함 합성 픽스처(186명): 라벨 시트로 예측 모드가 켜지고, 기준일 이후 기록(퇴사 발령·이후 근태·이후 평가)이 제외된다."""
-    sheets = make(N, 7)
+def test_fixture_requires_training_before_prediction(tmp_path: Path):
+    """A labeled current file must not silently train and score the same employees."""
     p = write_fixture(tmp_path / "fx.xlsx", with_labels=True)
-    lab = sheets["퇴사라벨"]
-    assert len(lab) == 186 and lab.left.sum() >= C.MIN_POSITIVES_FOR_MODEL and (lab.left <= lab.left_any_90d).all()
-    r = run(PREDICT, "--input", p, "--out", tmp_path / "out")
+    r = run(PREDICT, "--input", p, "--out", tmp_path / "blocked")
+    assert r.returncode == 2 and "train" in r.stderr and "Traceback" not in r.stderr
+    r = run(PREDICT, "--input", p, "--mode", "heuristic", "--out", tmp_path / "diagnostic")
     assert r.returncode == 0, r.stderr
-    s = json.loads((tmp_path / "out" / "summary.json").read_text(encoding="utf-8"))
-    assert s["analysis_mode"] == "predictive" and s["calc_mode"] == "model" and 0.5 <= s["model_metrics"]["cv_auc"] <= 1.0
-    leak = s["validation"]["leakage"]["excluded_rows_by_table"]
-    assert leak["personnel_actions"] == int(lab.left_any_180d.sum()) and leak["attendance_monthly"] > 0 and leak["performance_reviews"] > 0
-    by_id = {c["id"]: c["status"] for c in s["validation"]["checklist"]}
-    assert by_id["V2"] == "pass" and by_id["V6"] == "not_applicable" and by_id["V9"] == "warn"
-    assert s["hypotheses"]["evidence_kind"] == "검증 결과" and all(h["status"] in {"지지(단변량)", "반대(단변량)", "불명확", "데이터 없음"} for h in s["hypotheses"]["hypotheses"])
-    assert "시간 분리 검증은 아님" in s["question"]["answerable_question"]
+    s = json.loads((tmp_path / "diagnostic" / "summary.json").read_text())
+    assert s["analysis_mode"] == "diagnostic"
+    assert s["validation"]["leakage"]["excluded_rows_by_table"]["personnel_actions"] > 0
 
 
 def test_entry_scripts_run_end_to_end(workbook, tmp_path: Path):

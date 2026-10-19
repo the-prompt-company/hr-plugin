@@ -1,6 +1,6 @@
 {
   "name": "hr-attrition",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "HR 담당자용 퇴사 위험 분석 두 스킬: /predict_attrition(HR xlsx → 진단/예측 → 결과 엑셀), /make_dashboard(결과 엑셀 + 원본 → 인력 현황·퇴사 위험 대시보드). claude.ai 스킬과 같은 SKILL.md를 Claude Code에서도 쓴다.",
   "author": {
     "name": "The Prompt Company"

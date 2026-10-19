@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from . import config as C
-from .features import FEATURE_DOCS, numeric_matrix, phrase_for
+from .features import FEATURE_DOCS, numeric_matrix, phrase_for, hr_value
 
 # 규칙 가중치(표준화 z값에 곱한다). 부호는 FEATURE_DOCS의 위험 방향과 같아야 한다(테스트로 확인).
 HEURISTIC_WEIGHTS = {
@@ -107,10 +107,16 @@ def heuristic_scores(features: pd.DataFrame, weights: dict | None = None) -> Sco
     score = 1 / (1 + np.exp(-(raw / sd) * SCALE))
     Zall = _zscores(X[available])
     out = _frame(X, score.to_numpy(), contrib, "heuristic", Zall)
+    observed = []
+    for eid in X.index:
+        ranked = contrib.loc[eid].sort_values(ascending=False)
+        keys = [c for c in ranked.index if ranked[c] > .05][:3]
+        observed.append("; ".join(hr_value(c, X.at[eid,c], X[c].median()) for c in keys) or "뚜렷한 단일 신호 없음")
+    out["drivers_plain"] = observed
     used = sorted(w.index.tolist())
     skipped = sorted(set(weights) - set(used))
     metrics = dict(mode="heuristic",
-                   note="라벨이 없어 규칙 기반 신호 지수를 계산했다. 예측 확률이 아니라 회사 안에서의 상대 지수(0~1)다.",
+                   note="고정 예측 모델을 적용하지 않아 규칙 기반 신호 지수를 계산했다. 예측 확률이 아니라 회사 안에서의 상대 지수(0~1)다.",
                    weights={k: weights[k] for k in used}, weights_skipped_no_data=skipped, weights_full=dict(weights),
                    features_used=sorted(X.columns.tolist()), **policy_dict(),
                    n_employees=int(len(out)), band_counts=out.risk_band.value_counts().to_dict())
@@ -158,14 +164,7 @@ def score(features: pd.DataFrame, labels: pd.Series | None, mode: str = "auto", 
         return heuristic_scores(features, weights)
     if labels is None:
         raise ValueError("모델 모드에는 라벨이 필요합니다.")
-    try:
-        return model_scores(features, labels)
-    except (ValueError, ImportError) as e:
-        if mode == "model":
-            raise
-        res = heuristic_scores(features, weights)
-        res.metrics["fallback_reason"] = f"모델 대신 규칙 지수 사용: {e}"
-        return res
+    raise ValueError("현재 입력으로 재학습하지 않습니다. train과 --model-artifact를 사용하세요.")
 
 
 def save_result(res: ScoreResult, out_dir: Path):

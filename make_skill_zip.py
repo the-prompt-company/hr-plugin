@@ -75,7 +75,7 @@ def check_zips(sample_xlsx: Path | None) -> None:
             print(f"[check] {name}: engine {ver} OK")
         if sample_xlsx and sample_xlsx.exists():
             out = tdp / "out"
-            r = subprocess.run([sys.executable, str(tdp / "predict_attrition" / "scripts" / "predict_attrition.py"), "--input", str(sample_xlsx), "--out", str(out)],
+            r = subprocess.run([sys.executable, str(tdp / "predict_attrition" / "scripts" / "predict_attrition.py"), "--input", str(sample_xlsx), "--mode", "heuristic", "--out", str(out)],
                                capture_output=True, text=True, env={**__import__("os").environ, "PYTHONUTF8": "1"})
             assert r.returncode == 0, r.stderr
             r = subprocess.run([sys.executable, str(tdp / "make_dashboard" / "scripts" / "make_dashboard.py"), "--result", str(out / "퇴사위험_결과.xlsx"), "--out", str(out)],

@@ -76,6 +76,8 @@ def validate(features: pd.DataFrame, res, labels: pd.Series | None, as_of: str, 
     checked = features.attrs.get("date_columns_checked", [])
     if not checked:
         checks.append(_check("V2", "기준일 이후 정보 제외", "not_evaluable", "검사할 날짜 컬럼이 없다(이력 없는 명부). 시점 누수를 확인할 수 없다.", []))
+    elif features.attrs.get("unchecked_date_tables"):
+        checks.append(_check("V2", "기준일 이후 정보 제외", "not_evaluable", "날짜가 없어 제외한 이력: " + ", ".join(features.attrs["unchecked_date_tables"])))
     elif unparse:
         checks.append(_check("V2", "기준일 이후 정보 제외", "warn",
                              f"날짜 컬럼 {len(checked)}개 검사, 기준일 이후 {sum(excluded.values())}행 제외. 날짜를 읽지 못해 제외한 행 {sum(unparse.values())}건: " +
@@ -105,7 +107,7 @@ def validate(features: pd.DataFrame, res, labels: pd.Series | None, as_of: str, 
     else:
         method = dict(mode="model", description=res.metrics.get("algorithm"), cv_auc=res.metrics.get("cv_auc"), positives=res.metrics.get("positives"),
                       n_train=res.metrics.get("n_train"), bands=res.metrics.get("bands"), band_counts=res.metrics.get("band_counts"))
-        checks.append(_check("V4", "점수 산정 방식 공개", "pass", f"{res.metrics.get('algorithm')} · CV AUC {res.metrics.get('cv_auc')} · 양성 {res.metrics.get('positives')}", ["EV-METHOD"]))
+        checks.append(_check("V4", "점수 산정 방식 공개", "pass", f"{res.metrics.get('algorithm')} · 고정 모델 {res.metrics.get('model_id', '실험용')} · {res.metrics.get('band_method', '평가용')}", ["EV-METHOD"]))
 
     # V5 반례
     ce = _counterexamples(f, s)
@@ -125,7 +127,7 @@ def validate(features: pd.DataFrame, res, labels: pd.Series | None, as_of: str, 
         else:
             checks.append(_check("V6", "순위 안정성", "not_evaluable", "사용 가능한 신호가 없어 감도 분석 불가", []))
     else:
-        checks.append(_check("V6", "순위 안정성", "not_applicable", "모델 모드에서는 교차검증 AUC로 대체", []))
+        checks.append(_check("V6", "순위 안정성", "not_applicable", "고정 모델 적용: 기간별 성능과 직원별 그룹 평가는 evaluation.json 참조", []))
 
     # V7 커버리지
     coverage = [dict(signal=FEATURE_DOCS[c][0], feature=c, coverage_pct=round(100 * float(f[c].notna().mean()), 1)) for c in ALLOWED_FEATURES if c in f]
@@ -144,7 +146,13 @@ def validate(features: pd.DataFrame, res, labels: pd.Series | None, as_of: str, 
                          [f"EV-PRE-{i['code']}" for i in pre]))
 
     # V9 라벨·정확도
-    if labels is None:
+    if res.metrics.get("evaluation"):
+        ev = res.metrics["evaluation"]
+        checks.append(_check("V9", "미래 기간 평가", "warn" if ev.get("synthetic") or not ev.get("beats_baseline") else "pass",
+                             f"미래 기간 평균 Precision@{ev['top_k']}={ev['future_evaluation']['mean_precision_at_k']:.3f}; " + ("합성 데이터, 실제 성능 미검증" if ev.get("synthetic") else "운영 출시 판단은 별도"), ["evaluation.json"]))
+    elif res.mode == "heuristic":
+        checks.append(_check("V9", "정확도 검증", "not_evaluable", "진단 지수에는 미래 기간 예측 성능이 없다. 별도 학습·기간 분리 평가가 필요하다.", []))
+    elif labels is None:
         checks.append(_check("V9", "정확도 검증", "not_evaluable", "실제 퇴사 라벨이 없어 정확도를 측정할 수 없다. 지수는 진단용이며 예측 확률이 아니다.", []))
     else:
         checks.append(_check("V9", "정확도 검증", "warn", f"무작위 층화 교차검증 AUC {res.metrics.get('cv_auc')} (양성 {res.metrics.get('positives')}). 시간 분리 평가가 아니므로 출시 성능 근거가 아니다(P5).", ["EV-METHOD"]))
@@ -153,7 +161,7 @@ def validate(features: pd.DataFrame, res, labels: pd.Series | None, as_of: str, 
                    "성별·국적·체류자격·혼인·가족·주거·거주지·병역은 쓰지 않았다. 다른 신호가 이들과 상관될 가능성은 남아 있다.",
                    "병가·설문 미응답은 개인 점수에 쓰지 않았다(조직 집계에만 참고)."]
     if res.mode == "heuristic":
-        limitations.insert(0, "라벨(실제 퇴사)이 없어 가중치는 가설에 근거한 사전 설정값이다. 지수는 예측 확률이 아니며 정확도를 측정할 수 없다.")
+        limitations.insert(0, "고정 예측 모델을 적용하지 않아 가중치는 가설에 근거한 사전 설정값이다. 지수는 예측 확률이 아니며 정확도를 측정할 수 없다.")
     if low_cov:
         limitations.append("커버리지 50% 미만 신호: " + ", ".join(r["signal"] for r in low_cov))
     if res.metrics.get("fallback_reason"):

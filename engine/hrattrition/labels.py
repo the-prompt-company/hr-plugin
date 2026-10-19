@@ -1,43 +1,78 @@
-"""퇴사 라벨: 워크북의 '퇴사라벨'/'labels' 시트, 명부의 '퇴사여부' 컬럼, 또는 별도 CSV. 형식: employee_id,left[,left_date]."""
-from pathlib import Path
+"""Construct outcomes from event dates, type and complete observation windows.
 
+A binary left column is not a sufficient label contract. Non-target exits are
+excluded from voluntary-exit training (competing event), never silent negatives.
+"""
+from pathlib import Path
 import pandas as pd
 
-from .data import Dataset
-
-_TRUTHY = {"1": 1, "0": 0, "true": 1, "false": 0, "y": 1, "n": 0, "yes": 1, "no": 0, "예": 1, "아니오": 0, "퇴사": 1, "재직": 0}
-
-
-def _to_series(df: pd.DataFrame, where: str) -> pd.Series:
-    cols = {str(c).strip().lower(): c for c in df.columns}
-    id_col = cols.get("employee_id") or cols.get("사번")
-    left_col = cols.get("left") or cols.get("퇴사여부") or cols.get("퇴사")
-    if id_col is None or left_col is None:
-        raise ValueError(f"{where}: employee_id(사번)와 left(퇴사여부) 컬럼이 필요합니다.")
-    raw = df[left_col].map(lambda v: None if v is None or (isinstance(v, float) and pd.isna(v)) else str(v).strip().lower())
-    left = raw.map(lambda v: _TRUTHY.get(v) if v is not None else None)
-    if left.isna().any():
-        bad = raw[left.isna()].dropna().unique()[:5]
-        raise ValueError(f"{where}: left 값은 0/1, true/false, 예/아니오여야 합니다. 잘못된 값: {list(bad)}")
-    s = pd.Series(left.astype(int).to_numpy(), index=df[id_col].astype(str).str.strip(), name="left")
-    if s.index.duplicated().any():
-        raise ValueError(f"{where}: employee_id가 중복된 라벨 행이 있습니다.")
-    return s
+TARGETS = {"자발적 퇴사", "전체 퇴사"}
+VOLUNTARY = {"자발적", "자발적 퇴사", "voluntary"}
+OTHER = {"비자발적", "비자발적 퇴사", "involuntary", "계약만료", "계약 만료", "정년", "retirement"}
 
 
-def load_labels(ds: Dataset, path: Path | None = None) -> pd.Series | None:
-    """우선순위: --labels CSV > 워크북 라벨 시트/명부 컬럼. 없으면 None."""
+def build_labels(frame, as_of, target="자발적 퇴사", horizon_days=90):
+    if target not in TARGETS or horizon_days <= 0:
+        raise ValueError("target은 자발적 퇴사/전체 퇴사, horizon_days는 양수여야 합니다.")
+    df = frame.rename(columns={"사번": "employee_id", "퇴사일": "left_date", "퇴사유형": "left_type", "관측종료일": "observed_until"}).copy()
+    required = {"employee_id", "left_date", "left_type", "observed_until"}
+    if not required <= set(df):
+        raise ValueError("기간별 라벨에는 employee_id, left_date, left_type, observed_until이 필요합니다. left(0/1)만으로 학습하지 않습니다.")
+    ids = df.employee_id.astype('string').str.strip()
+    if ids.isna().any() or ids.str.lower().isin(['', 'none', 'nan', 'nat']).any() or ids.duplicated().any():
+        raise ValueError("라벨 사번은 비어 있지 않은 고유 문자열이어야 합니다. 재입사는 고용 에피소드별로 분리하세요.")
+    dates = {}
+    for col in ('left_date', 'observed_until'):
+        raw = df[col].replace('', None)
+        dates[col] = pd.to_datetime(raw, errors='coerce')
+        if (raw.notna() & dates[col].isna()).any() or df.attrs.get('date_parse_errors', {}).get(col):
+            raise ValueError(f"라벨 날짜를 해석할 수 없습니다: {col}")
+    left, observed = dates['left_date'], dates['observed_until']
+    if observed.isna().any() or (left.notna() & (left > observed)).any():
+        raise ValueError("관측 종료일이 없거나 퇴사일보다 이릅니다.")
+    types = df.left_type.fillna('').astype(str).str.strip().str.lower()
+    if (left.isna() & types.ne('')).any():
+        raise ValueError("퇴사 유형은 있지만 퇴사일이 없습니다.")
+    if 'left' in df and (left.isna() & df.left.astype(str).str.lower().isin(['1', '1.0', 'true', '예', '퇴사'])).any():
+        raise ValueError("퇴사 라벨 1인 행에 퇴사일이 없습니다.")
+    start, end = pd.Timestamp(as_of), pd.Timestamp(as_of) + pd.Timedelta(days=horizon_days)
+    y = pd.Series(float('nan'), index=df.index, dtype=float)
+    status = pd.Series('관측 미완료', index=df.index)
+    at_risk = (left.isna() | left.gt(start)) & observed.ge(start)
+    complete = at_risk & observed.ge(end)
+    in_window = at_risk & left.gt(start) & left.le(end)
+    y.loc[complete & ~in_window] = 0
+    status.loc[complete & ~in_window] = '기간 내 대상 사건 없음'
+    if target == '전체 퇴사':
+        event = in_window
+    else:
+        known = types.isin(VOLUNTARY | OTHER)
+        status.loc[in_window & ~known] = '퇴사 유형 불명'
+        status.loc[in_window & types.isin(OTHER)] = '경쟁 사건 제외'
+        event = in_window & types.isin(VOLUNTARY)
+    y.loc[event] = 1
+    status.loc[event] = '대상 퇴사'
+    status.loc[~at_risk] = '기준일 모집단 아님'
+    y.index = ids.astype(str)
+    y.name = 'left'
+    y.attrs = dict(target=target, horizon_days=horizon_days, as_of=start.date().isoformat(),
+                   statuses=dict(zip(ids.astype(str), status)), excluded=int(y.isna().sum()),
+                   label_window_end=end.date().isoformat())
+    return y
+
+
+def load_labels(ds, path: Path | None = None, target="자발적 퇴사", horizon_days=90):
     if path is not None:
-        path = Path(path)
-        if not path.exists():
-            raise FileNotFoundError(f"라벨 파일 없음: {path}")
-        return _to_series(pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig"), str(path))
-    if ds.has("labels"):
-        return _to_series(ds["labels"], "라벨 시트")
-    return None
+        df = pd.read_csv(path, dtype=str, keep_default_na=False, encoding='utf-8-sig')
+    elif ds.has('labels'):
+        df = ds['labels']
+    else:
+        return None
+    return build_labels(df, ds.manifest['as_of'], target, horizon_days)
 
 
-def describe_labels(s: pd.Series | None, n_employees: int) -> dict:
+def describe_labels(s, n_employees):
     if s is None:
         return dict(present=False, rows=0, positives=0, coverage_pct=0.0)
-    return dict(present=True, rows=int(len(s)), positives=int(s.sum()), coverage_pct=round(100 * len(s) / max(n_employees, 1), 1))
+    return dict(present=True, rows=int(s.notna().sum()), positives=int(s.sum()),
+                excluded=int(s.isna().sum()), coverage_pct=round(100*s.notna().sum()/max(n_employees, 1), 1))

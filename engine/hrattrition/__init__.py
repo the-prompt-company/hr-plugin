@@ -2,4 +2,4 @@
 
 버전의 단일 원천. pyproject는 이 값을 읽고(dynamic), make_skill_zip.py는 plugin.json과 일치하는지 검사한다.
 """
-__version__ = "0.4.0"
+__version__ = "0.5.0"

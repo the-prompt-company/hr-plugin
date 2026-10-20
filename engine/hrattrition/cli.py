@@ -40,6 +40,7 @@ def _add_predict_args(ap):
     ap.add_argument("--as-of", dest="as_of", help="기준일 YYYY-MM-DD (파일에 명시적 기준일이 없거나 충돌할 때 지정)")
     ap.add_argument("--labels", type=Path, help="라벨 CSV(employee_id,left). 없으면 워크북의 라벨 시트를 찾는다")
     ap.add_argument("--mode", choices=["auto", "model", "heuristic"], default=None, help="계산 방식(기본 auto)")
+    ap.add_argument("--model-artifact", type=Path, help="train으로 만든 신뢰할 수 있는 고정 모델(model.joblib)")
     ap.add_argument("--weights", type=Path, help="규칙 가중치 덮어쓰기 JSON {신호: 가중치}")
     ap.add_argument("--spec", type=Path, help="이전 실행의 analysis_spec.json을 재사용(명시적 CLI 인자가 우선)")
     ap.add_argument("--top", type=int, default=None, help="요약에 넣을 상위 위험 직원 수(기본 10)")
@@ -95,7 +96,18 @@ def predict(args) -> tuple[Path | None, dict | None]:
     # 1 질문 정의 (CLI > 스펙 > 기본값)
     q = QuestionSpec.from_args(args.target, args.horizon_days, args.population, parse_filters(args.filter), args.spec, args.prompt)
     q.as_of, q.as_of_source = ds.manifest["as_of"], ds.manifest.get("as_of_source")
-    labels = load_labels(ds, args.labels)
+    model_path = getattr(args, "model_artifact", None)
+    saved_model = settings["spec"].get("model_reference")
+    if not model_path and saved_model:
+        import hashlib
+        model_path = Path(saved_model["path"])
+        if not model_path.is_file() or hashlib.sha256(model_path.read_bytes()).hexdigest() != saved_model["sha256"]:
+            raise ValueError("재사용 스펙의 모델 파일이 없거나 변경되었습니다. --model-artifact로 사용할 모델을 명시하세요.")
+    if model_path and settings["mode"] == "heuristic":
+        raise ValueError("--model-artifact와 --mode heuristic은 함께 사용할 수 없습니다.")
+    if settings["mode"] == "model" and not model_path:
+        raise ValueError("예측에는 --model-artifact가 필요합니다. 과거 스냅샷으로 train을 먼저 실행하세요.")
+    labels = None if model_path else load_labels(ds, args.labels, q.target, q.horizon_days)
     q.analysis_mode = "diagnostic"   # predictive는 라벨이 있고 모델이 실제로 적용될 때만 아래에서 승격
     # 2b 데이터 이해
     f_all = build_features(ds)
@@ -111,14 +123,26 @@ def predict(args) -> tuple[Path | None, dict | None]:
     if labels is not None:
         labels = labels[labels.index.isin(f.employee_id.astype(str))]
     d = describe_labels(labels, pop["after"])
-    print("[labels] " + (f"있음 (행 {d['rows']}, 양성 {d['positives']}, 커버리지 {d['coverage_pct']}%)" if d["present"] else "없음 → 진단 모드(규칙 기반 신호 지수)"))
+    print("[labels] " + (f"있음 (행 {d['rows']}, 양성 {d['positives']}, 커버리지 {d['coverage_pct']}%)" if d["present"] else ("현재 라벨 미사용 → 고정 모델 적용" if model_path else "없음 → 진단 모드(규칙 기반 신호 지수)")))
     # 3 점수 + 가설
-    res = score(f, labels, settings["mode"], settings["weights"])
+    if model_path:
+        from .training import predict_frozen
+        res = predict_frozen(f_all, model_path, q.as_of, q.target, q.horizon_days, ds.manifest["company"]["name"])
+        # Population views retain company-wide ranks and bands.
+        res.scores = res.scores[res.scores.employee_id.isin(f.employee_id)].copy()
+        res.contrib = res.contrib.reindex(f.employee_id)
+    else:
+        if labels is not None and settings["mode"] != "heuristic":
+            raise ValueError("라벨이 있는 파일로 현재 직원을 재학습하지 않습니다. train으로 과거 학습/미래 평가를 분리하세요. 진단만 하려면 --mode heuristic을 지정하세요.")
+        res = score(f, None, "heuristic", settings["weights"])
+    if model_path:
+        import hashlib
+        res.metrics["model_reference"] = dict(path=str(Path(model_path).resolve()), sha256=hashlib.sha256(Path(model_path).read_bytes()).hexdigest())
     if res.mode == "model":
         q.analysis_mode = "predictive"
     print(f"[1 질문] {q.sentence()}")
     save_result(res, out)
-    print(f"[score] 계산 {res.mode} · 밴드 {res.metrics.get('band_counts')}" + (f" · CV AUC {res.metrics['cv_auc']}" if res.mode == "model" else ""))
+    print(f"[score] 계산 {res.mode} · 밴드 {res.metrics.get('band_counts')}" + (f" · CV AUC {res.metrics['cv_auc']}" if "cv_auc" in res.metrics else ""))
     hyp = evaluate_hypotheses(f, res.scores, labels)
     print(f"[3 가설] {hyp['evidence_kind']}: " + ", ".join(f"{h['id']} {h['status']}" for h in hyp["hypotheses"]))
     # 4 검증
@@ -160,10 +184,12 @@ def dashboard(args) -> Path | None:
         except Exception as e:  # noqa: BLE001 - 원본은 선택 입력
             print(f"[data] 원본 데이터를 읽지 못해 결과 파일만으로 현황을 만듭니다: {e}")
     manifest = meta["manifest"]
+    if raw and (str(raw.manifest.get("as_of")) != str(manifest.get("as_of")) or raw.manifest["company"]["name"] != manifest["company"]["name"]):
+        raise ValueError("대시보드 원본과 결과의 회사·기준일이 다릅니다.")
     ov = build_overview(features, str(manifest.get("as_of")), raw)
     extras = read_result_extras(result)
     p = build_dashboard(features, scores, meta["metrics"], manifest, ov, out / "dashboard.html", meta["unavailable"], extras)
-    print(f"[dashboard] {p} · 터미널 레이아웃 (원본 {'포함: 월별 추세·스파크라인' if raw else '없음'})")
+    print(f"[dashboard] {p} · 직원 목록 중심 화면 (원본 {'포함: 필터 연동 근무·설문' if raw else '없음'})")
     if getattr(args, "share", False):
         ps = build_dashboard(features, scores, meta["metrics"], manifest, ov, out / "dashboard_share.html", meta["unavailable"], extras, share=True)
         print(f"[dashboard] {ps} · 공유용(이름·사번 제거, 가명 P-001…)")
@@ -175,9 +201,12 @@ def dashboard(args) -> Path | None:
     return p
 
 
-def main(argv=None):
+def _main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
+    pt = sub.add_parser("train", help="과거 스냅샷 학습·후보 비교·미래 기간 평가 → 고정 모델")
+    pt.add_argument("--manifest", type=Path, required=True)
+    pt.add_argument("--out", type=Path, required=True)
     p1 = sub.add_parser("predict", help="진단/예측 → 결과 엑셀")
     _add_predict_args(p1)
     p1.add_argument("--out", type=Path)
@@ -194,6 +223,11 @@ def main(argv=None):
     p3.add_argument("--share", action="store_true", help="공유용 dashboard_share.html도 생성(이름·사번 제거)")
     args = ap.parse_args(argv)
 
+    if args.cmd == "train":
+        from .training import train
+        path, report = train(args.manifest, args.out)
+        print(f"모델 {path} · 선택 {report['selected']} · 미래 기간 평균 Precision@K {report['future_evaluation']['mean_precision_at_k']:.3f}")
+        return
     if args.cmd == "predict":
         xlsx, info = predict(args)
         if xlsx is None:
@@ -207,6 +241,14 @@ def main(argv=None):
             sys.exit(EXIT_BLOCKED)
         args.result = xlsx
         dashboard(args)
+
+
+def main(argv=None):
+    try:
+        return _main(argv)
+    except (ValueError, FileNotFoundError, ImportError) as error:
+        print(json.dumps({"error": str(error), "status": "blocked"}, ensure_ascii=False), file=sys.stderr)
+        raise SystemExit(EXIT_BLOCKED) from None
 
 
 if __name__ == "__main__":

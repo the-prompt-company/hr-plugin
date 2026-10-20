@@ -17,4 +17,9 @@ for cand in (HERE, HERE.parents[2] / "engine"):
 from hrattrition.cli import main  # noqa: E402
 
 if __name__ == "__main__":
-    main(["predict", *sys.argv[1:]])
+    args = sys.argv[1:]
+    if "--train-manifest" in args:
+        args[args.index("--train-manifest")] = "--manifest"
+        main(["train", *args])
+    else:
+        main(["predict", *args])

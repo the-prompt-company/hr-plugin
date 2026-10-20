@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from . import config as C
-from .features import FEATURE_DOCS, PLAIN
+from .features import FEATURE_DOCS, PLAIN, hr_value
 from .model import ScoreResult
 
 ACTIONS = {   # 신호 → (조치 범주, 구체 제안)
@@ -74,12 +74,15 @@ def build_summary(features: pd.DataFrame, res: ScoreResult, manifest: dict, top_
         high_ids = df.loc[df.risk_band == "높음", "employee_id"]
         mean_contrib = res.contrib.reindex(high_ids).mean().sort_values(ascending=False)
         for feat, v in mean_contrib.head(5).items():
-            if v <= 0.1:
+            if v <= (0.005 if res.mode == "model" else 0.1):
                 break
-            label = PLAIN.get(feat, (FEATURE_DOCS.get(feat, (feat,))[0], ""))
+            observed_mean = df.loc[df.employee_id.isin(high_ids), feat].mean()
+            label = (hr_value(feat, observed_mean), "원시 값과 최근 변경 이력을 확인")
             signals.append(dict(feature=feat, plain=label[0], check=label[1] if len(label) > 1 else "", avg_contribution=round(float(v), 2)))
             if feat in ACTIONS:
                 cat, act = ACTIONS[feat]
+                if res.mode == "model":
+                    act = "실제 값·최근 변동·직원 상황을 확인한 뒤 지원 조치 여부를 결정"
                 actions.append(dict(category=cat, action=act, signal=label[0]))
     unavailable = features.attrs.get("unavailable", [])
     # 5단계 행동 연결: 상위 팀별로 '확인할 사항'을 붙인다
@@ -88,9 +91,9 @@ def build_summary(features: pd.DataFrame, res: ScoreResult, manifest: dict, top_
         for _, u in by_unit.head(5).iterrows():
             ids_u = df.loc[(df.division_name == u.division_name) & (df.org_unit_name == u.org_unit_name), "employee_id"]
             mc = res.contrib.reindex(ids_u).mean().sort_values(ascending=False)
-            checks = [PLAIN[c][1] for c in mc.head(2).index if c in PLAIN and mc[c] > 0.1]
+            checks = ["최근 변경 이력과 해당 직원의 상황을 확인" for c in mc.head(2).index if c in PLAIN and mc[c] > 0.005]
             unit_actions.append(dict(division_name=u.division_name, org_unit_name=u.org_unit_name, n=int(u.n), avg_risk=round(float(u.avg_risk), 3),
-                                     signals=[PLAIN[c][0] for c in mc.head(2).index if c in PLAIN and mc[c] > 0.1], hr_checks=checks))
+                                     signals=[hr_value(c, df.loc[df.employee_id.isin(ids_u), c].mean()) for c in mc.head(2).index if c in PLAIN and mc[c] > 0.005], hr_checks=checks))
     analysis_mode = (question or {}).get("analysis_mode", "diagnostic")
     mode_label = {"predictive": "예측 모드(라벨 기반 모델)", "change": "변화 비교 모드", "diagnostic": "진단 모드(규칙 기반 신호 지수 · 예측 아님)"}[analysis_mode]
     return dict(
@@ -110,7 +113,7 @@ def build_summary(features: pd.DataFrame, res: ScoreResult, manifest: dict, top_
         unavailable_signals=[FEATURE_DOCS[c][0] for c in unavailable if c in FEATURE_DOCS],
         caveats=[
             "진단 모드의 지수는 예측 확률이 아니라 여러 신호를 모은 회사 내 상대 순위다. 개인 평가나 인사 조치의 단독 근거로 쓰면 안 된다."
-            if res.mode != "model" else "예측 확률은 과거 라벨 패턴에 기반하며, 무작위 교차검증 AUC는 시간 분리 평가가 아니므로 출시 성능 근거가 아니다.",
+            if res.mode != "model" else "고정 모델의 점수는 확인 우선순위용이며 보정된 퇴사 확률이 아니다. 성능은 별도 미래 기간 평가를 참고한다.",
             "성별·국적·체류자격·혼인·가족·주거·거주지·병역은 계산에 쓰지 않았다. 병가·설문 미응답은 개인 점수에서 제외했다.",
             "신호는 '확인해 볼 지점'이며 직원 개인의 성향이나 태도를 뜻하지 않는다.",
         ],
@@ -150,6 +153,15 @@ def write_result_workbook(features: pd.DataFrame, res: ScoreResult, summary: dic
                  ("unavailable_json", json.dumps(features.attrs.get("unavailable", []), ensure_ascii=False)),
                  ("manifest_json", json.dumps({k: v for k, v in manifest.items() if k != "column_mapping"}, ensure_ascii=False, default=str)),
                  ("schema", C.RESULT_SCHEMA)]
+    # Excel text cells are limited to 32767 characters; preserve large evaluation reports.
+    expanded = []
+    for key, value in meta_rows:
+        if isinstance(value, str) and len(value) > 30000:
+            expanded.append((key, "@chunks"))
+            expanded.extend((f"{key}_{i//16000:04d}", value[i:i+16000]) for i in range(0, len(value), 16000))
+        else:
+            expanded.append((key, value))
+    meta_rows = expanded
     # 방법론 단계별 시트
     q = summary.get("question") or {}
     question_df = pd.DataFrame([("분석 모드", summary.get("mode_label", "")),
@@ -198,7 +210,7 @@ def write_result_workbook(features: pd.DataFrame, res: ScoreResult, summary: dic
         val_df.to_excel(w, sheet_name="4 검증", index=False)
         unit_act.to_excel(w, sheet_name="5 팀별 확인사항", index=False)
         staff.to_excel(w, sheet_name="직원별 위험", index=False)
-        pd.DataFrame(summary["top_units"]).rename(columns={"division_name": "본부", "org_unit_name": "팀", "avg_risk": "평균 위험", "n": "인원", "high": "높음 인원"}).to_excel(w, sheet_name="팀별", index=False)
+        df.groupby(["division_name", "org_unit_name"]).agg(avg_risk=("risk_score", "mean"), n=("employee_id", "size"), high=("risk_band", lambda x: int((x == "높음").sum()))).reset_index().rename(columns={"division_name": "본부", "org_unit_name": "팀", "avg_risk": "평균 위험", "n": "인원", "high": "높음 인원"}).to_excel(w, sheet_name="팀별", index=False)
         signals.to_excel(w, sheet_name="회사 전체 신호", index=False)
         actions.to_excel(w, sheet_name="조치 제안", index=False)
         feats.to_excel(w, sheet_name="신호 상세", index=False)
@@ -213,7 +225,7 @@ def write_analysis_spec(summary: dict, res: ScoreResult, weights_override: dict 
     from . import __version__
     spec = dict(schema=C.SPEC_SCHEMA, engine_version=__version__,
                 question={k: v for k, v in (summary.get("question") or {}).items() if k not in ("as_of", "as_of_source")},
-                mode_requested=mode_requested, mode_applied=res.mode, analysis_mode=summary.get("analysis_mode", "diagnostic"),
+                mode_requested=mode_requested, mode_applied=res.mode, model_reference=res.metrics.get("model_reference"), analysis_mode=summary.get("analysis_mode", "diagnostic"),
                 weights_override=weights_override or {}, weights_full=res.metrics.get("weights_full") or res.metrics.get("weights"),
                 tenure_bump=res.metrics.get("tenure_bump"), scale=res.metrics.get("scale"), bands=res.metrics.get("bands"),
                 feature_policy=dict(allowed_features=res.metrics.get("allowed_features"), excluded_from_individual_weights=res.metrics.get("excluded_from_individual_weights"),
@@ -314,6 +326,9 @@ def read_result_workbook(path: Path) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     data = pd.read_excel(xf, sheet_name=C.DATA_SHEET, dtype={"employee_id": str})
     meta_df = pd.read_excel(xf, sheet_name=C.META_SHEET, dtype=str).fillna("")
     meta = dict(zip(meta_df["key"], meta_df["value"]))
+    for key, value in list(meta.items()):
+        if value == "@chunks":
+            meta[key] = "".join(meta[k] for k in sorted(meta) if k.startswith(key + "_") and k[len(key)+1:].isdigit())
     meta["metrics"] = json.loads(meta.get("metrics_json") or "{}")
     meta["unavailable"] = json.loads(meta.get("unavailable_json") or "[]")
     meta["manifest"] = json.loads(meta.get("manifest_json") or "{}")

@@ -39,7 +39,7 @@ FEATURE_DOCS = {
     "survey_engagement": ("설문 몰입·관리자·성장(1~5)", "최근 설문의 몰입·성장·관리자·자율성 문항 평균", -1),
     "survey_pay_perception": ("설문 보상 인식(1~5)", "최근 설문 '보상 인식' 문항", -1),
     "survey_workload": ("설문 워라밸(1~5)", "최근 설문 '워라밸' 문항", -1),
-    "survey_enps": ("eNPS(0~10)", "최근 설문 추천의향", -1),
+    "survey_enps": ("추천 의향(0~10)", "최근 설문 추천의향", -1),
     "survey_nonresponse": ("설문 미응답", "최근 설문 미응답이면 1", +1),
 }
 NUMERIC_FEATURES = list(FEATURE_DOCS)
@@ -124,6 +124,10 @@ def build_features(ds: Dataset) -> pd.DataFrame:
         snap = emp.copy()
     if not len(snap):
         raise ValueError("employees_current 또는 employees 시트가 필요합니다.")
+    if "employment_status" in snap:
+        snap = snap[snap.employment_status.isin(["재직", "휴직"])].copy()
+    if "hire_date" in snap:
+        snap = snap[pd.to_datetime(snap.hire_date, errors="coerce") <= as_of].copy()
     snap = snap.set_index("employee_id")
     emp = emp.set_index("employee_id") if len(emp) else pd.DataFrame(index=snap.index)
     ids = snap.index.tolist()
@@ -132,19 +136,26 @@ def build_features(ds: Dataset) -> pd.DataFrame:
     excluded: dict[str, int] = {}
     unparseable: dict[str, int] = {}
     date_checked: list[str] = []
+    unchecked: list[str] = []
 
     def cutoff(df: pd.DataFrame, table: str, date_col: str) -> pd.DataFrame:
         """기준일 이후 기록 제외(누수 차단). 날짜를 읽지 못한 행도 시점을 확인할 수 없으므로 제외하고 건수를 기록한다."""
-        if not len(df) or date_col not in df:
+        if not len(df):
             return df
+        if date_col not in df:
+            unchecked.append(f"{table}.{date_col}")
+            return df.iloc[:0].copy()
         date_checked.append(f"{table}.{date_col}")
         d = pd.to_datetime(df[date_col], errors="coerce")
         after = d.notna() & (d > as_of)
-        bad = d.isna() & df[date_col].notna()
+        bad = d.isna()
         excluded[table] = excluded.get(table, 0) + int(after.sum())
         if int(bad.sum()):
             unparseable[table] = unparseable.get(table, 0) + int(bad.sum())
-        return df[~after & ~bad]
+        out = df[~after & ~bad]
+        if date_col != "recorded_at" and "recorded_at" in out:
+            out = cutoff(out, table + ".recorded", "recorded_at")
+        return out
 
     def col(df, name, default=np.nan):
         return df[name].reindex(ids) if name in df else pd.Series(default, index=ids)
@@ -171,7 +182,7 @@ def build_features(ds: Dataset) -> pd.DataFrame:
     f["is_leader"] = (col(snap, "role_title", "팀원").fillna("팀원") != "팀원").astype(int)
     f["is_fixed_term"] = col(snap, "employment_type", "").fillna("").astype(str).str.startswith("기간제").astype(int)
     ce = pd.to_datetime(col(snap, "contract_end_date"), errors="coerce")
-    f["contract_ending_90d"] = (ce.notna() & (ce <= as_of + pd.Timedelta(days=90))).astype(int)
+    f["contract_ending_90d"] = (ce.notna() & (ce >= as_of) & (ce <= as_of + pd.Timedelta(days=90))).astype(int)
     f["on_leave"] = (col(snap, "employment_status", "재직") == "휴직").astype(int)
     f["base_annual_krw10k"] = pd.to_numeric(col(snap, "base_annual_krw10k"), errors="coerce")
 
@@ -238,6 +249,8 @@ def build_features(ds: Dataset) -> pd.DataFrame:
         am = am[~bad].copy()
         am["m"] = pd.to_datetime(am.pay_month.astype(str), format="%Y-%m").dt.to_period("M")
         cur_m = pd.Period(as_of, freq="M")
+        if not as_of.is_month_end:
+            cur_m -= 1
         excluded["attendance_monthly"] = int((am.m > cur_m).sum())
         am = am[am.m <= cur_m]
         for c in ("overtime_hours", "late_count", "absent_days", "sick_days"):
@@ -309,6 +322,7 @@ def build_features(ds: Dataset) -> pd.DataFrame:
     f.attrs["excluded_after_as_of"] = excluded
     f.attrs["unparseable_dates"] = unparseable
     f.attrs["date_columns_checked"] = date_checked
+    f.attrs["unchecked_date_tables"] = unchecked
     f.attrs["has_history"] = True
     return f.reset_index()
 
@@ -317,6 +331,10 @@ def _features_from_roster(ds: Dataset) -> pd.DataFrame:
     """직원 명부 한 장: 있는 컬럼으로만 신호를 만든다."""
     r = ds["roster"].set_index("employee_id")
     as_of = pd.Timestamp(ds.as_of)
+    if "employment_status" in r:
+        r = r[r.employment_status.isin(["재직", "휴직"])].copy()
+    if "hire_date" in r:
+        r = r[pd.to_datetime(r.hire_date, errors="coerce") <= as_of].copy()
     ids = r.index.tolist()
     f = pd.DataFrame(index=pd.Index(ids, name="employee_id"))
     f["name"] = r["name"] if "name" in r else ids
@@ -339,7 +357,7 @@ def _features_from_roster(ds: Dataset) -> pd.DataFrame:
     f["is_fixed_term"] = f["employment_type"].fillna("").astype(str).str.contains("기간제|계약").astype(int)
     if "contract_end_date" in r:
         ce = pd.to_datetime(r["contract_end_date"], errors="coerce")
-        f["contract_ending_90d"] = (ce.notna() & (ce <= as_of + pd.Timedelta(days=90))).astype(int)
+        f["contract_ending_90d"] = (ce.notna() & (ce >= as_of) & (ce <= as_of + pd.Timedelta(days=90))).astype(int)
     else:
         f["contract_ending_90d"] = 0
     f["on_leave"] = f["employment_status"].fillna("").astype(str).str.contains("휴직").astype(int)
@@ -374,10 +392,13 @@ def _features_from_roster(ds: Dataset) -> pd.DataFrame:
             checked.append(f"roster.{c}")
             d = pd.to_datetime(r[c], errors="coerce")
             bad = d.isna() & r[c].notna()
-            if int(bad.sum()):
-                unparseable[f"roster.{c}"] = int(bad.sum())
+            bad_count = max(int(bad.sum()), int(r.attrs.get("date_parse_errors", {}).get(c, 0)))
+            if bad_count:
+                unparseable[f"roster.{c}"] = bad_count
             if int((d > as_of).sum()):
                 excluded[f"roster.{c}"] = int((d > as_of).sum())
+            feature = {"hire_date": "tenure_years", "last_raise_date": "months_since_raise", "last_promotion_date": "months_since_promotion"}[c]
+            f.loc[d.isna() | (d > as_of), feature] = np.nan
     if "hire_date" in r:
         hd = pd.to_datetime(r["hire_date"], errors="coerce")
         f.loc[(hd > as_of).reindex(f.index).fillna(False).to_numpy(), "tenure_years"] = np.nan
@@ -399,3 +420,29 @@ def numeric_matrix(features: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"민감 속성이 피처 테이블에 들어 있습니다: {leaked}")
     cols = [c for c in ALLOWED_FEATURES if c in features]
     return features.set_index("employee_id")[cols].astype(float)
+
+
+def hr_value(feature, value, reference=None):
+    """Observed HR value, with an explicit comparison reference; no causal claim."""
+    if pd.isna(value):
+        return f'{FEATURE_DOCS.get(feature, (feature,))[0]}: 데이터 없음'
+    label = FEATURE_DOCS.get(feature, (feature,))[0]
+    units = {'tenure_years':'년', 'base_annual_krw10k':'만원', 'months_since_raise':'개월',
+             'months_since_promotion':'개월', 'last_raise_pct':'%', 'ot_hours_m6':'시간/월',
+             'ot_trend':'시간/월', 'late_count_m6':'회', 'absent_days_m6':'일',
+             'promotion_holds_2y':'회', 'leave_rejected_12m':'회', 'training_hours_12m':'시간',
+             'oncall_weeks_12m':'주', 'survey_enps':'점/10', 'survey_engagement':'점/5',
+             'survey_pay_perception':'점/5', 'survey_workload':'점/5', 'last_rating_score':'점/5'}
+    if feature in ('is_leader','is_fixed_term','contract_ending_90d','on_leave'):
+        return label + (': 해당' if value else ': 해당 없음')
+    if feature == 'band_position':
+        return f'보상 밴드 내 위치 {value*100:.0f}%'
+    if feature == 'leave_usage_rate':
+        return f'연차 사용률 {value*100:.0f}%'
+    if feature == 'ot_trend':
+        return f'최근 3개월 월평균 연장근로 {abs(value):.1f}시간 {"증가" if value>=0 else "감소"}(직전 3개월 대비)'
+    unit = units.get(feature,'')
+    text = f'{label} {value:.1f}{unit}'
+    if reference is not None and pd.notna(reference):
+        text += f' (비교 기준 {reference:.1f}{unit})'
+    return text

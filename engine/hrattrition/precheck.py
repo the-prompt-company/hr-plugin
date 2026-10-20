@@ -52,8 +52,8 @@ def precheck(ds: Dataset) -> list[dict]:
         issues.append(_issue("ID_DUPLICATE", "blocking", f"{emp_table}에 중복 사번 {dup.nunique()}개({len(dup)}행): {', '.join(dup.unique()[:5])}",
                              affected=["employee_id"], refs=[f"{src}#{emp_table}"], blocks=["features", "scores"],
                              resolution="중복 행을 합치거나 어느 행이 맞는지 정한다. 이름이 같아도 자동으로 합치지 않는다."))
-    if ids.isna().any() or (ids == "").any() or (ids.str.lower() == "nan").any():
-        n = int(ids.isna().sum() + (ids == "").sum() + (ids.str.lower() == "nan").sum())
+    if ids.isna().any() or (ids == "").any() or (ids.str.lower().isin(["nan", "none", "nat"])).any():
+        n = int(ids.isna().sum() + (ids == "").sum() + (ids.str.lower().isin(["nan", "none", "nat"])).sum())
         issues.append(_issue("ID_BLANK", "blocking", f"{emp_table}에 사번이 비어 있는 행 {n}건", affected=["employee_id"], refs=[f"{src}#{emp_table}"],
                              blocks=["features", "scores"], resolution="사번을 채우거나 해당 행을 제거한다."))
     if ds.manifest.get("temp_ids"):
@@ -77,7 +77,7 @@ def precheck(ds: Dataset) -> list[dict]:
                 continue
             raw = df[c]
             parsed = pd.to_datetime(raw, errors="coerce")
-            bad = int((parsed.isna() & raw.notna()).sum())
+            bad = int((parsed.isna() & raw.notna()).sum()) + df.attrs.get("date_parse_errors", {}).get(c, 0)
             if bad:
                 issues.append(_issue("DATE_PARSE_FAIL", "warn", f"{table}.{c}에서 날짜로 읽지 못한 값 {bad}건(해당 행은 피처 계산에서 제외).",
                                      affected=[f"{table}.{c}"], refs=[f"{src}#{table}"], blocks=[], resolution="날짜 형식(YYYY-MM-DD)을 통일한다."))

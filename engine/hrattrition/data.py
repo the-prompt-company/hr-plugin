@@ -79,6 +79,7 @@ class Dataset:
 
 def coerce(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    date_errors = dict(df.attrs.get("date_parse_errors", {}))
     df.columns = [str(c).strip() for c in df.columns]
     for col in df.columns:
         s = df[col]
@@ -91,6 +92,9 @@ def coerce(df: pd.DataFrame) -> pd.DataFrame:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)   # 혼합 형식 날짜의 형식 추론 경고
                 df[col] = pd.to_datetime(s, errors="coerce")
+                bad = int((s.notna() & df[col].isna()).sum())
+                if bad:
+                    date_errors[col] = date_errors.get(col, 0) + bad
             continue
         if s.dtype == object:
             vals = s.dropna()
@@ -104,6 +108,7 @@ def coerce(df: pd.DataFrame) -> pd.DataFrame:
                 df[col] = as_str.str.lower().map({"true": True, "false": False}).reindex(s.index)
             else:
                 df[col] = s
+    df.attrs["date_parse_errors"] = date_errors
     return df
 
 
@@ -185,7 +190,7 @@ def _manifest_from_workbook(sheets: dict, tables: dict, path: Path) -> dict:
             candidates["employees_current.as_of(복수)"] = ", ".join(v.isoformat() for v in vals[:3])
     distinct = {v for k, v in candidates.items() if "복수" not in k}
     as_of = next(iter(distinct)) if len(distinct) == 1 else None
-    conflict = None if len(distinct) <= 1 else "; ".join(f"{k}={v}" for k, v in candidates.items())
+    conflict = None if len(distinct) <= 1 and not any("복수" in k for k in candidates) else "; ".join(f"{k}={v}" for k, v in candidates.items())
     n = len(snap) if snap is not None else len(tables.get("employees", []))
     return dict(company=dict(name=company), as_of=as_of, as_of_source=("file:" + next(iter(candidates)) if as_of else None),
                 as_of_conflict=conflict, preset=info.get("프리셋") or path.stem, employee_count=int(n), source_file=path.name)
@@ -246,6 +251,8 @@ def load_any(path_or_preset: str, dataset_root: Path | None = None, as_of: str |
     else:
         raise FileNotFoundError(f"입력을 찾을 수 없습니다: {path_or_preset}")
     if as_of:
+        if ds.manifest.get("as_of") and ds.manifest["as_of"] != pd.Timestamp(as_of).date().isoformat():
+            raise ValueError("파일 스냅샷 기준일을 다른 날짜로 바꿀 수 없습니다. 해당 시점의 원본 스냅샷을 사용하세요.")
         ds.manifest["as_of"] = pd.to_datetime(as_of).date().isoformat()
         ds.manifest["as_of_source"] = "user"
         ds.manifest["as_of_conflict"] = None

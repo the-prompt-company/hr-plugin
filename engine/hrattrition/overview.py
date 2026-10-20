@@ -51,7 +51,8 @@ def build_overview(features: pd.DataFrame, as_of: str, raw: Dataset | None = Non
 def _from_raw(ds: Dataset, f: pd.DataFrame) -> dict:
     out: dict = {}
     ids = set(f.employee_id.astype(str))
-    as_of_m = str(pd.Period(pd.Timestamp(ds.as_of), freq="M")) if ds.manifest.get("as_of") else None
+    cutoff = pd.Timestamp(ds.as_of)
+    as_of_m = str(pd.Period(cutoff, freq="M") - (0 if cutoff.is_month_end else 1)) if ds.manifest.get("as_of") else None
     am = ds["attendance_monthly"]
     if len(am):
         am = am[am.employee_id.astype(str).isin(ids)].copy()
@@ -60,6 +61,7 @@ def _from_raw(ds: Dataset, f: pd.DataFrame) -> dict:
             am = am[am.pay_month <= as_of_m]   # 현황도 기준일 이후 월은 쓰지 않는다(예측 탭과 같은 시점 규칙)
         for c in ("overtime_hours", "late_count", "absent_days", "recognized_hours"):
             am[c] = pd.to_numeric(am[c], errors="coerce")
+        out["monthly_by_employee"] = am[["employee_id", "pay_month", "overtime_hours", "late_count"]].where(pd.notna(am), None).to_dict("records")
         g = am.groupby("pay_month").agg(overtime=("overtime_hours", "mean"), late=("late_count", "sum"), absent=("absent_days", "sum"),
                                         hours=("recognized_hours", "mean"), n=("employee_id", "nunique")).sort_index()
         out["monthly"] = dict(labels=g.index.tolist(), overtime=[round(float(v), 1) for v in g.overtime.fillna(0)],
@@ -75,18 +77,22 @@ def _from_raw(ds: Dataset, f: pd.DataFrame) -> dict:
         if ds.manifest.get("as_of") and "closed_at" in sv:
             sv = sv[pd.to_datetime(sv.closed_at, errors="coerce") <= pd.Timestamp(ds.as_of)]
         rows = []
+        detail = []
         for _, s in sv.sort_values("closed_at").iterrows():
             q = sq[sq.survey_id == s.survey_id].set_index("question_id")
-            ans = sa[sa.question_id.isin(q.index)].copy()
+            ans = sa[sa.question_id.isin(q.index) & sa.employee_id.astype(str).isin(ids)].copy()
             ans["dimension"] = ans.question_id.map(q.dimension)
             ans["value"] = pd.to_numeric(ans.value, errors="coerce")
+            detail.extend(dict(employee_id=str(e), survey=str(s.survey_id), closed_at=str(pd.Timestamp(s.closed_at).date()), dimension=str(d), value=float(v)) for (e,d),v in ans.groupby(["employee_id","dimension"]).value.mean().items() if pd.notna(v))
             dims = ans.groupby("dimension").value.mean()
             rows.append(dict(survey=str(s.survey_id), closed_at=str(pd.Timestamp(s.closed_at).date()) if pd.notna(s.closed_at) else "",
                              dims={k: round(float(v), 2) for k, v in dims.items()}))
+        out["survey_by_employee"] = detail
         if rows:
             out["survey"] = rows[-2:]   # 최근 2개 설문 비교
     snap = ds["employees_current"]
     if len(snap) and "annual_leave_granted" in snap:
+        snap = snap[snap.employee_id.astype(str).isin(ids)]
         g = pd.to_numeric(snap.annual_leave_granted, errors="coerce").sum()
         u = pd.to_numeric(snap.annual_leave_used, errors="coerce").sum()
         out["leave"] = dict(granted=float(g), used=float(u), rate=round(100 * u / g, 1) if g else None)
